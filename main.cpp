@@ -1581,9 +1581,11 @@ int main(
     char *argv[]
 ) {
 
-    // must be root
+    // Running as non-root is OK if udev permissions allow access to the USB device.
     auto euid = geteuid();
-    LOG_FTL(0!=euid, "must be root, euid is %d, bailing", euid);
+    if (euid != 0) {
+        LOG_NFO("running as non-root (euid=%d); relying on udev permissions", euid);
+    }
 
     // load config file
     loadConfig();
