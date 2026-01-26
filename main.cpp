@@ -10,6 +10,7 @@
 
 // stuff we need
 #include <log.h>
+#include <map>
 #include <string>
 #include <thread>
 #include <time.h>
@@ -1144,6 +1145,9 @@ static auto operateDevice(
     }
 
     // step: read segments one by one
+    // Global map to store tags from ALL segments by timestamp
+    std::map<std::string, uint8_t> globalTagMap;
+    
     int segIndex = 0;
     while(true) {
 
@@ -1166,6 +1170,133 @@ static auto operateDevice(
             LOG_NFO("segment has %d entries", (int)nbEntries);
             o -= 2;
 
+            // First pass: extract all tags from records of different sizes
+            // Similar to extract_labels.py: try record sizes 8, 10, 12, 14, 16
+            size_t payload_start = 30;
+            size_t payload_end = (size_t)bytesRead;
+            
+            if(payload_end > payload_start + 2) {
+                auto cvt = [](
+                    uint8_t x
+                ) {
+                    int v = -1;
+                    char buf[8];
+                    sprintf(buf, "%02X", x);
+                    sscanf(buf, "%d", &v);
+                    return v;
+                };
+
+                // Find first timestamp offset (look for 0x20 followed by valid year)
+                size_t first_ts_offset = 0;
+                for(size_t i = payload_start + 2; i < payload_end - 7; i++) {
+                    if(buffer[i] == 0x20) {
+                        auto yy_byte = buffer[i+1];
+                        if(0x20 <= yy_byte && yy_byte <= 0x30) {
+                            auto mm = cvt(buffer[i+2]);
+                            auto dd = cvt(buffer[i+3]);
+                            auto hh = cvt(buffer[i+4]);
+                            auto mn = cvt(buffer[i+5]);
+                            auto ss = cvt(buffer[i+6]);
+                            if(mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 && 
+                               hh >= 0 && hh <= 23 && mn >= 0 && mn <= 59 && ss >= 0 && ss <= 59) {
+                                first_ts_offset = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Try different record sizes: 8, 10, 12, 14, 16
+                // Search entire payload, not just from first_ts_offset
+                int record_sizes[] = {8, 10, 12, 14, 16};
+                for(int rec_size_idx = 0; rec_size_idx < 5; rec_size_idx++) {
+                    int rec_len = record_sizes[rec_size_idx];
+                    // Scan entire payload for records of this size
+                    // Start from payload_start + 2 (skip nbEntries), search entire payload
+                    for(size_t pos = payload_start + 2; pos + rec_len <= payload_end; pos += rec_len) {
+                        // Try to parse timestamp - don't require 0x20 at start
+                        auto cc = cvt(buffer[pos]);
+                        auto yy = cvt(buffer[pos+1]);
+                        auto mm = cvt(buffer[pos+2]);
+                        auto dd = cvt(buffer[pos+3]);
+                        auto hh = cvt(buffer[pos+4]);
+                        auto mn = cvt(buffer[pos+5]);
+                        auto ss = cvt(buffer[pos+6]);
+                        
+                        // Validate timestamp - if not valid, continue to next record
+                        if(cc < 0 || yy < 0 || mm < 1 || mm > 12 || dd < 1 || dd > 31 || 
+                           hh < 0 || hh > 23 || mn < 0 || mn > 59 || ss < 0 || ss > 59) {
+                            continue;
+                        }
+                        
+                        // Try to find tag in positions: r[7], r[8], r[-1], r[-2]
+                        uint8_t tag = 0;
+                        uint8_t candidates[4] = {0, 0, 0, 0};
+                        if(rec_len >= 8) candidates[0] = buffer[pos+7];
+                        if(rec_len >= 9) candidates[1] = buffer[pos+8];
+                        if(rec_len >= 1) candidates[2] = buffer[pos+rec_len-1];
+                        if(rec_len >= 2) candidates[3] = buffer[pos+rec_len-2];
+                        
+                        for(int j = 0; j < 4; j++) {
+                            if(candidates[j] >= 1 && candidates[j] <= 4) {
+                                tag = candidates[j];
+                                break;
+                            }
+                        }
+                        
+                        if(tag > 0 && tag <= 4) {
+                            // Create timestamp key (YYYY-MM-DD HH:MM) - minute precision
+                            // Format matches extract_labels.py: "%Y-%m-%d %H:%M"
+                            int year = 2000 + yy;
+                            char tsKey[32];
+                            snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mm, dd, hh, mn);
+                            // Only add if not already present (avoid overwriting)
+                            if(globalTagMap.find(std::string(tsKey)) == globalTagMap.end()) {
+                                globalTagMap[std::string(tsKey)] = tag;
+                                LOG_NFO("Found tag %d for timestamp %s (record size %d, pos=0x%04X)", tag, tsKey, rec_len, (unsigned int)pos);
+                            }
+                        }
+                    }
+                }
+                
+                // Additional search: look for tags near timestamps (more flexible)
+                // Search for values 1-4 and check if there's a valid timestamp nearby
+                for(size_t i = payload_start + 2; i < payload_end - 7; i++) {
+                    // Check if this could be a tag value (1-4)
+                    if(buffer[i] >= 1 && buffer[i] <= 4) {
+                        // Check for timestamp before the tag (within 16 bytes)
+                        for(int offset = -16; offset <= 0; offset++) {
+                            if((int)i + offset < (int)payload_start + 2) continue;
+                            size_t ts_pos = i + offset;
+                            if(ts_pos + 6 >= payload_end) continue;
+                            
+                            auto cc = cvt(buffer[ts_pos]);
+                            auto yy = cvt(buffer[ts_pos+1]);
+                            auto mm = cvt(buffer[ts_pos+2]);
+                            auto dd = cvt(buffer[ts_pos+3]);
+                            auto hh = cvt(buffer[ts_pos+4]);
+                            auto mn = cvt(buffer[ts_pos+5]);
+                            auto ss = cvt(buffer[ts_pos+6]);
+                            
+                            if(cc >= 0 && yy >= 0 && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 && 
+                               hh >= 0 && hh <= 23 && mn >= 0 && mn <= 59 && ss >= 0 && ss <= 59) {
+                                uint8_t tag = buffer[i];
+                                int year = 2000 + yy;
+                                char tsKey[32];
+                                snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mm, dd, hh, mn);
+                                if(globalTagMap.find(std::string(tsKey)) == globalTagMap.end()) {
+                                    globalTagMap[std::string(tsKey)] = tag;
+                                    LOG_NFO("Found tag %d for timestamp %s (flexible search, pos=0x%04X)", tag, tsKey, (unsigned int)i);
+                                }
+                                break; // Found timestamp, move to next potential tag
+                            }
+                        }
+                    }
+                }
+
+            }
+
+            // Second pass: process glucose measurements and match with tags
             for(int i=0; i<nbEntries; ++i) {
 
                 // decode weird-ass encoding of datetime values
@@ -1177,6 +1308,19 @@ static auto operateDevice(
                     sprintf(buf, "%02X", x);
                     sscanf(buf, "%d", &v);
                     return v;
+                };
+
+                // map meal tag to description
+                auto getTagDesc = [](
+                    uint8_t tag
+                ) -> const char* {
+                    switch(tag) {
+                        case 1: return "Antes comida";
+                        case 2: return "Desp. comida";
+                        case 3: return "En ayunas";
+                        case 4: return "Al acostarse";
+                        default: return "";
+                    }
                 };
 
                 // load date
@@ -1191,11 +1335,37 @@ static auto operateDevice(
                 auto ro = (14 + o);
                 auto vv = be16r(buffer, ro);
                 auto ss = be16r(buffer, ro);
+                
+                // Look up tag in global map first
+                // Format matches extract_labels.py: "%Y-%m-%d %H:%M"
+                int year = 2000 + yy;
+                char tsKey[32];
+                snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mm, dd, hh, mn);
+                uint8_t tag = 0;
+                auto it = globalTagMap.find(std::string(tsKey));
+                if(it != globalTagMap.end()) {
+                    tag = it->second;
+                } else {
+                    // Also try to find tag directly in the measurement record
+                    // According to extract_markers.py: tag is at byte 11 of 12-byte record
+                    // Record starts at buffer[6+o], so tag is at buffer[17+o]
+                    // Also try other positions from extract_labels.py: r[7], r[8], r[-1], r[-2]
+                    uint8_t candidates[] = {buffer[13+o], buffer[14+o], buffer[16+o], buffer[17+o]};
+                    for(int j = 0; j < 4; j++) {
+                        if(candidates[j] >= 1 && candidates[j] <= 4) {
+                            tag = candidates[j];
+                            // Also add to global map for future reference
+                            globalTagMap[std::string(tsKey)] = tag;
+                            break;
+                        }
+                    }
+                }
+
                 o += 12;
 
                 // dump sample
                 LOG_NFO(
-                    "sample: %02d%02d/%02d/%02d %02d:%02d => (mg/dL=%2d, mmol/L=%7.3f, status=0x%02x)",
+                    "sample: %02d%02d/%02d/%02d %02d:%02d => (mg/dL=%2d, mmol/L=%7.3f, status=0x%02x, tag=%d)",
                     cc,
                     yy,
                     mm,
@@ -1204,7 +1374,8 @@ static auto operateDevice(
                     mn,
                     vv,
                     (vv / 18.0),
-                    ss
+                    ss,
+                    tag
                 );
 
                 // compute epoch
@@ -1220,21 +1391,41 @@ static auto operateDevice(
 
                 // write sample as JSON
                 if(0==ss) {
-                    fprintf(
-                        g_output,
-                        "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f }",
-                        (g_firstLine ? "" : ","),
-                        (int)(g_lineCount++),
-                        (uint64_t)epoch,
-                        (int)cc,
-                        (int)yy,
-                        (int)mm,
-                        (int)dd,
-                        (int)hh,
-                        (int)mn,
-                        (int)vv,
-                        (vv / 18.0)
-                    );
+                    const char* tagDesc = getTagDesc(tag);
+                    if(tag > 0 && tag <= 4) {
+                        fprintf(
+                            g_output,
+                            "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f, \"tag\":\"%s\" }",
+                            (g_firstLine ? "" : ","),
+                            (int)(g_lineCount++),
+                            (uint64_t)epoch,
+                            (int)cc,
+                            (int)yy,
+                            (int)mm,
+                            (int)dd,
+                            (int)hh,
+                            (int)mn,
+                            (int)vv,
+                            (vv / 18.0),
+                            tagDesc
+                        );
+                    } else {
+                        fprintf(
+                            g_output,
+                            "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f }",
+                            (g_firstLine ? "" : ","),
+                            (int)(g_lineCount++),
+                            (uint64_t)epoch,
+                            (int)cc,
+                            (int)yy,
+                            (int)mm,
+                            (int)dd,
+                            (int)hh,
+                            (int)mn,
+                            (int)vv,
+                            (vv / 18.0)
+                        );
+                    }
                     g_firstLine = false;
                 }
             }
