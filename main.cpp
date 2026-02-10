@@ -23,9 +23,6 @@
 #include <algorithm>
 #include <inttypes.h>
 #include <unordered_map>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <errno.h>
 #include <libusb-1.0/libusb.h>
 
 // config key value pair map
@@ -1123,11 +1120,16 @@ static auto operateDevice(
         }
     };
 
-    bool dumpDirReady = false;
-    const char* dumpDir = "out_payloads_live";
+    int segMax = 3;
+    if(const char* env = getenv("ACCUCHEK_SEG_MAX")) {
+        int v = atoi(env);
+        if(v >= 0) {
+            segMax = v;
+        }
+    }
 
-    // request segments by id (0..3) so we can fetch meal-tag records too
-    for(int segId = 0; segId <= 3; ++segId) {
+    // request segments by id (0..segMax) so we can fetch meal-tag records too
+    for(int segId = 0; segId <= segMax; ++segId) {
 
         // protocol step: start request for data segments
         {
@@ -1178,27 +1180,6 @@ static auto operateDevice(
             auto status = buffer[32];
             updateInvokeId();
 
-            // dump raw data segment for offline analysis
-            if(!dumpDirReady) {
-                if(mkdir(dumpDir, 0755) == 0 || errno == EEXIST) {
-                    dumpDirReady = true;
-                } else {
-                    LOG_WRN("failed to create dump dir '%s' (errno=%d), skipping dumps", dumpDir, errno);
-                    dumpDirReady = false;
-                }
-            }
-            if(dumpDirReady && bytesRead > 0) {
-                char fname[128];
-                snprintf(fname, sizeof(fname), "%s/seg_%02d_%04d.bin", dumpDir, segId, segIndex);
-                FILE* fp = fopen(fname, "wb");
-                if(fp) {
-                    fwrite(buffer, 1, bytesRead, fp);
-                    fclose(fp);
-                } else {
-                    LOG_WRN("failed to open dump file '%s' (errno=%d)", fname, errno);
-                }
-            }
-
             // fish some data we need to send back in the "confirm" message
             size_t o = 22;
             auto u0 = be32r(buffer, o);
@@ -1213,8 +1194,8 @@ static auto operateDevice(
                 LOG_NFO("segment has %d entries", (int)nbEntries);
                 o -= 2;
 
-                // Parse tags only from the meal segment (segId=3), record length = 10
-                if(segId == 3) {
+                // Parse tags from non-glucose segments using the meal record signature, record length = 10
+                if(segId != 0) {
                     size_t payload_start = 30;
                     size_t payload_end = (size_t)bytesRead;
 
@@ -1270,6 +1251,11 @@ static auto operateDevice(
                             int da = bcd_to_int(buffer[pos + 3]);
                             int hh = bcd_to_int(buffer[pos + 4]);
                             int mi = bcd_to_int(buffer[pos + 5]);
+                            // meal record signature observed in CMeal segment
+                            if(buffer[pos + 7] != 0x00 || buffer[pos + 8] != 0x72) {
+                                continue;
+                            }
+
                             uint8_t code = buffer[pos + 9];
 
                             uint8_t tag = 0;
@@ -1278,7 +1264,12 @@ static auto operateDevice(
                                 case 0x50: tag = 2; break; // Desp. Comida
                                 case 0x54: tag = 3; break; // En Ayunas
                                 case 0x74: tag = 4; break; // Al acostarse
-                                default: tag = 0; break;
+                                default:
+                                    if(code != 0x00) {
+                                        tag = 5; // Otro (unknown meal code)
+                                        LOG_WRN("Unknown meal code 0x%02X at %04d-%02d-%02d %02d:%02d", code, year, mo, da, hh, mi);
+                                    }
+                                    break;
                             }
 
                             if(tag > 0) {
