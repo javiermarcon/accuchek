@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <inttypes.h>
 #include <unordered_map>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 #include <libusb-1.0/libusb.h>
 
 // config key value pair map
@@ -698,7 +701,8 @@ static auto operateDevice(
     // lambda to receive a message via bulk transfer
     auto bulkIn = [&](
         const char *msgName,
-        size_t maxLen = BUFFER_SIZE
+        size_t maxLen = BUFFER_SIZE,
+        bool allowTimeout = false
     ) {
         // make some noise
         printf("\n");
@@ -719,6 +723,10 @@ static auto operateDevice(
             5000                    // timeout in ms
         );
         if(0!=fail) {
+            if(allowTimeout && fail == LIBUSB_ERROR_TIMEOUT) {
+                LOG_WRN("timeout waiting for message %s -- skipping", msgName);
+                return -1;
+            }
             LOG_WRN("failed to receive message %s -- giving up", msgName);
             LOG_WRN("libusb error was :%s", libusb_strerror(fail));
             exit(1);
@@ -1085,384 +1093,370 @@ static auto operateDevice(
 
     // ----> here, the original js code sets the device time ... skip for now
 
-    // protocol step: start request for data segments
-    {
-        auto p = buffer;
-        memset(buffer, 0, sizeof(buffer));
-        be16(p, kAPDU_TYPE_PRESENTATION_APDU); // msg type
-        be16(p,     16);                       // length
-        be16(p,     14);                       // octet stringlength
-        be16(p, (1+invokeId));                 // invoke-id from prev answer
-        be16(p, kDATA_ADPU_INVOKE_CONFIRMED_ACTION);
-        be16(p,      8);                       // length of what follows (could also be zero)
-        be16(p, pmStoreHandle);                // store handle
-        be16(p, kACTION_TYPE_MDC_ACT_SEG_TRIG_XFER);
-        be16(p,      2);                       // length
-        be16(p,      0);                       // segment
-
-        bulkOut(
-            "request segments",
-            (p-buffer)
-        );
-    }
-
-    // step: read segment stream header answer
-    {
-        auto bytesRead = bulkIn("segment headers");
-        updateInvokeId();
-
-        uint16_t dataResponse = 0;
-        if(22<=bytesRead) {
-            size_t o = 20;
-            dataResponse = be16r(buffer, o);
-        }
-
-        if(22==bytesRead && 0!=dataResponse) {
-            if(3==dataResponse) {
-                LOG_WRN("empty data segment -- giving up");
-            } else {
-                LOG_NFO(
-                    "error retrieving data, code = %d",
-                    (int)dataResponse
-                );
-            }
-            exit(1);
-        }
-
-        uint16_t headerValue = -1;
-        if(16<=bytesRead) {
-            size_t o = 14;
-            headerValue = be16r(buffer, o);
-        }
-
-        if(
-            (bytesRead < 22) ||
-            (kACTION_TYPE_MDC_ACT_SEG_TRIG_XFER!=headerValue)
-        ) {
-            LOG_WRN("unexpected / incorrect answer packet -- giving up");
-            exit(1);
-        }
-    }
-
-    // step: read segments one by one
-    // Global map to store tags from ALL segments by timestamp
+    // Global map to store tags by timestamp
     std::map<std::string, uint8_t> globalTagMap;
-    
-    int segIndex = 0;
-    while(true) {
 
-        // get data and update invokeId
-        auto bytesRead = bulkIn("data segment");
-        auto status = buffer[32];
-        updateInvokeId();
+    struct Measurement {
+        int cc;
+        int yy;
+        int mm;
+        int dd;
+        int hh;
+        int mn;
+        int vv;
+        uint16_t ss;
+        uint64_t epoch;
+    };
 
-        // fish some data we need to send back in the "confirm" message
-        size_t o = 22;
-        auto u0 = be32r(buffer, o);
-        auto u1 = be32r(buffer, o);
-        auto u2 = be16r(buffer, o);
+    std::vector<Measurement> measurements;
 
-        // lambda to parse samples out of each segment
-        auto parseData = [&]() {
+    auto getTagDesc = [](
+        uint8_t tag
+    ) -> const char* {
+        switch(tag) {
+            case 1: return "Antes comida";
+            case 2: return "Desp. Comida";
+            case 3: return "En Ayunas";
+            case 4: return "Al acostarse";
+            case 5: return "Otro";
+            default: return "";
+        }
+    };
 
-            size_t o = 30;
-            auto nbEntries = be16r(buffer, o);
-            LOG_NFO("segment has %d entries", (int)nbEntries);
-            o -= 2;
+    bool dumpDirReady = false;
+    const char* dumpDir = "out_payloads_live";
 
-            // First pass: extract all tags from records of different sizes
-            // Similar to extract_labels.py: try record sizes 8, 10, 12, 14, 16
-            size_t payload_start = 30;
-            size_t payload_end = (size_t)bytesRead;
-            
-            if(payload_end > payload_start + 2) {
-                auto cvt = [](
-                    uint8_t x
-                ) {
-                    int v = -1;
-                    char buf[8];
-                    sprintf(buf, "%02X", x);
-                    sscanf(buf, "%d", &v);
-                    return v;
-                };
+    // request segments by id (0..3) so we can fetch meal-tag records too
+    for(int segId = 0; segId <= 3; ++segId) {
 
-                // Find first timestamp offset (look for 0x20 followed by valid year)
-                size_t first_ts_offset = 0;
-                for(size_t i = payload_start + 2; i < payload_end - 7; i++) {
-                    if(buffer[i] == 0x20) {
-                        auto yy_byte = buffer[i+1];
-                        if(0x20 <= yy_byte && yy_byte <= 0x30) {
-                            auto mm = cvt(buffer[i+2]);
-                            auto dd = cvt(buffer[i+3]);
-                            auto hh = cvt(buffer[i+4]);
-                            auto mn = cvt(buffer[i+5]);
-                            auto ss = cvt(buffer[i+6]);
-                            if(mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 && 
-                               hh >= 0 && hh <= 23 && mn >= 0 && mn <= 59 && ss >= 0 && ss <= 59) {
-                                first_ts_offset = i;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Try different record sizes: 8, 10, 12, 14, 16
-                // Search entire payload, not just from first_ts_offset
-                int record_sizes[] = {8, 10, 12, 14, 16};
-                for(int rec_size_idx = 0; rec_size_idx < 5; rec_size_idx++) {
-                    int rec_len = record_sizes[rec_size_idx];
-                    // Scan entire payload for records of this size
-                    // Start from payload_start + 2 (skip nbEntries), search entire payload
-                    for(size_t pos = payload_start + 2; pos + rec_len <= payload_end; pos += rec_len) {
-                        // Try to parse timestamp - don't require 0x20 at start
-                        auto cc = cvt(buffer[pos]);
-                        auto yy = cvt(buffer[pos+1]);
-                        auto mm = cvt(buffer[pos+2]);
-                        auto dd = cvt(buffer[pos+3]);
-                        auto hh = cvt(buffer[pos+4]);
-                        auto mn = cvt(buffer[pos+5]);
-                        auto ss = cvt(buffer[pos+6]);
-                        
-                        // Validate timestamp - if not valid, continue to next record
-                        if(cc < 0 || yy < 0 || mm < 1 || mm > 12 || dd < 1 || dd > 31 || 
-                           hh < 0 || hh > 23 || mn < 0 || mn > 59 || ss < 0 || ss > 59) {
-                            continue;
-                        }
-                        
-                        // Try to find tag in positions: r[7], r[8], r[-1], r[-2]
-                        uint8_t tag = 0;
-                        uint8_t candidates[4] = {0, 0, 0, 0};
-                        if(rec_len >= 8) candidates[0] = buffer[pos+7];
-                        if(rec_len >= 9) candidates[1] = buffer[pos+8];
-                        if(rec_len >= 1) candidates[2] = buffer[pos+rec_len-1];
-                        if(rec_len >= 2) candidates[3] = buffer[pos+rec_len-2];
-                        
-                        for(int j = 0; j < 4; j++) {
-                            if(candidates[j] >= 1 && candidates[j] <= 4) {
-                                tag = candidates[j];
-                                break;
-                            }
-                        }
-                        
-                        if(tag > 0 && tag <= 4) {
-                            // Create timestamp key (YYYY-MM-DD HH:MM) - minute precision
-                            // Format matches extract_labels.py: "%Y-%m-%d %H:%M"
-                            int year = 2000 + yy;
-                            char tsKey[32];
-                            snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mm, dd, hh, mn);
-                            // Only add if not already present (avoid overwriting)
-                            if(globalTagMap.find(std::string(tsKey)) == globalTagMap.end()) {
-                                globalTagMap[std::string(tsKey)] = tag;
-                                LOG_NFO("Found tag %d for timestamp %s (record size %d, pos=0x%04X)", tag, tsKey, rec_len, (unsigned int)pos);
-                            }
-                        }
-                    }
-                }
-                
-                // Additional search: look for tags near timestamps (more flexible)
-                // Search for values 1-4 and check if there's a valid timestamp nearby
-                for(size_t i = payload_start + 2; i < payload_end - 7; i++) {
-                    // Check if this could be a tag value (1-4)
-                    if(buffer[i] >= 1 && buffer[i] <= 4) {
-                        // Check for timestamp before the tag (within 16 bytes)
-                        for(int offset = -16; offset <= 0; offset++) {
-                            if((int)i + offset < (int)payload_start + 2) continue;
-                            size_t ts_pos = i + offset;
-                            if(ts_pos + 6 >= payload_end) continue;
-                            
-                            auto cc = cvt(buffer[ts_pos]);
-                            auto yy = cvt(buffer[ts_pos+1]);
-                            auto mm = cvt(buffer[ts_pos+2]);
-                            auto dd = cvt(buffer[ts_pos+3]);
-                            auto hh = cvt(buffer[ts_pos+4]);
-                            auto mn = cvt(buffer[ts_pos+5]);
-                            auto ss = cvt(buffer[ts_pos+6]);
-                            
-                            if(cc >= 0 && yy >= 0 && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31 && 
-                               hh >= 0 && hh <= 23 && mn >= 0 && mn <= 59 && ss >= 0 && ss <= 59) {
-                                uint8_t tag = buffer[i];
-                                int year = 2000 + yy;
-                                char tsKey[32];
-                                snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mm, dd, hh, mn);
-                                if(globalTagMap.find(std::string(tsKey)) == globalTagMap.end()) {
-                                    globalTagMap[std::string(tsKey)] = tag;
-                                    LOG_NFO("Found tag %d for timestamp %s (flexible search, pos=0x%04X)", tag, tsKey, (unsigned int)i);
-                                }
-                                break; // Found timestamp, move to next potential tag
-                            }
-                        }
-                    }
-                }
-
-            }
-
-            // Second pass: process glucose measurements and match with tags
-            for(int i=0; i<nbEntries; ++i) {
-
-                // decode weird-ass encoding of datetime values
-                auto cvt = [](
-                    uint8_t x
-                ) {
-                    int v = -1;
-                    char buf[8];
-                    sprintf(buf, "%02X", x);
-                    sscanf(buf, "%d", &v);
-                    return v;
-                };
-
-                // map meal tag to description
-                auto getTagDesc = [](
-                    uint8_t tag
-                ) -> const char* {
-                    switch(tag) {
-                        case 1: return "Antes comida";
-                        case 2: return "Desp. comida";
-                        case 3: return "En ayunas";
-                        case 4: return "Al acostarse";
-                        default: return "";
-                    }
-                };
-
-                // load date
-                auto cc = cvt(buffer[ 6 + o]);
-                auto yy = cvt(buffer[ 7 + o]);
-                auto mm = cvt(buffer[ 8 + o]);
-                auto dd = cvt(buffer[ 9 + o]);
-                auto hh = cvt(buffer[10 + o]);
-                auto mn = cvt(buffer[11 + o]);
-
-                // load value and status
-                auto ro = (14 + o);
-                auto vv = be16r(buffer, ro);
-                auto ss = be16r(buffer, ro);
-                
-                // Look up tag in global map first
-                // Format matches extract_labels.py: "%Y-%m-%d %H:%M"
-                int year = 2000 + yy;
-                char tsKey[32];
-                snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mm, dd, hh, mn);
-                uint8_t tag = 0;
-                auto it = globalTagMap.find(std::string(tsKey));
-                if(it != globalTagMap.end()) {
-                    tag = it->second;
-                } else {
-                    // Also try to find tag directly in the measurement record
-                    // According to extract_markers.py: tag is at byte 11 of 12-byte record
-                    // Record starts at buffer[6+o], so tag is at buffer[17+o]
-                    // Also try other positions from extract_labels.py: r[7], r[8], r[-1], r[-2]
-                    uint8_t candidates[] = {buffer[13+o], buffer[14+o], buffer[16+o], buffer[17+o]};
-                    for(int j = 0; j < 4; j++) {
-                        if(candidates[j] >= 1 && candidates[j] <= 4) {
-                            tag = candidates[j];
-                            // Also add to global map for future reference
-                            globalTagMap[std::string(tsKey)] = tag;
-                            break;
-                        }
-                    }
-                }
-
-                o += 12;
-
-                // dump sample
-                LOG_NFO(
-                    "sample: %02d%02d/%02d/%02d %02d:%02d => (mg/dL=%2d, mmol/L=%7.3f, status=0x%02x, tag=%d)",
-                    cc,
-                    yy,
-                    mm,
-                    dd,
-                    hh,
-                    mn,
-                    vv,
-                    (vv / 18.0),
-                    ss,
-                    tag
-                );
-
-                // compute epoch
-                struct tm t;
-                memset(&t, 0, sizeof(t));
-                t.tm_min = mn;
-                t.tm_hour = hh;
-                t.tm_mday = dd;
-                t.tm_mon = (mm-1);
-                t.tm_year = ((cc*100 + yy) - 1900);
-                //auto epoch = timegm(&t);
-                auto epoch = timelocal(&t);
-
-                // write sample as JSON
-                if(0==ss) {
-                    const char* tagDesc = getTagDesc(tag);
-                    if(tag > 0 && tag <= 4) {
-                        fprintf(
-                            g_output,
-                            "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f, \"tag\":\"%s\" }",
-                            (g_firstLine ? "" : ","),
-                            (int)(g_lineCount++),
-                            (uint64_t)epoch,
-                            (int)cc,
-                            (int)yy,
-                            (int)mm,
-                            (int)dd,
-                            (int)hh,
-                            (int)mn,
-                            (int)vv,
-                            (vv / 18.0),
-                            tagDesc
-                        );
-                    } else {
-                        fprintf(
-                            g_output,
-                            "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f }",
-                            (g_firstLine ? "" : ","),
-                            (int)(g_lineCount++),
-                            (uint64_t)epoch,
-                            (int)cc,
-                            (int)yy,
-                            (int)mm,
-                            (int)dd,
-                            (int)hh,
-                            (int)mn,
-                            (int)vv,
-                            (vv / 18.0)
-                        );
-                    }
-                    g_firstLine = false;
-                }
-            }
-        };
-
-        // parse received data segment
-        parseData();
-
-        // send "data received" ack
+        // protocol step: start request for data segments
         {
             auto p = buffer;
             memset(buffer, 0, sizeof(buffer));
             be16(p, kAPDU_TYPE_PRESENTATION_APDU); // msg type
-            be16(p,     30);                       // length
-            be16(p,     28);                       // octet stringlength
-            be16(p, invokeId);                     // invoke-id from prev answer
-            be16(p, kDATA_ADPU_RESPONSE_CONFIRMED_EVENT_REPORT);
-            be16(p,     22);                       // length of what follows (could also be zero)
+            be16(p,     16);                       // length
+            be16(p,     14);                       // octet stringlength
+            be16(p, (1+invokeId));                 // invoke-id from prev answer
+            be16(p, kDATA_ADPU_INVOKE_CONFIRMED_ACTION);
+            be16(p,      8);                       // length of what follows (could also be zero)
             be16(p, pmStoreHandle);                // store handle
-            be32(p, 0xFFFFFFFF);                   // relative time
-            be16(p, kEVENT_TYPE_MDC_NOTI_SEGMENT_DATA);
-            be16(p,     12);
-            be32(p,     u0);
-            be32(p,     u1);
-            be16(p,     u2);
-            be16(p, 0x0080);
+            be16(p, kACTION_TYPE_MDC_ACT_SEG_TRIG_XFER);
+            be16(p,      2);                       // length
+            be16(p, (uint16_t)segId);              // segment
 
             bulkOut(
-                "data segment received ACK",
+                "request segments",
                 (p-buffer)
             );
         }
 
-        // bail if segment was flagged as last one in the stream
-        if(0x40 & status) {
-            break;
+        // step: read segment stream header answer
+        {
+            auto bytesRead = bulkIn("segment headers", BUFFER_SIZE, true);
+            if(bytesRead < 0) {
+                LOG_WRN("no segment headers for segId=%d, skipping", segId);
+                continue;
+            }
+            updateInvokeId();
+
+            uint16_t dataResponse = 0;
+            if(22<=bytesRead) {
+                size_t o = 20;
+                dataResponse = be16r(buffer, o);
+            }
         }
+
+        int segIndex = 0;
+        while(true) {
+
+            // get data and update invokeId
+            auto bytesRead = bulkIn("data segment", BUFFER_SIZE, true);
+            if(bytesRead < 0) {
+                LOG_WRN("timeout waiting for data segment segId=%d, aborting this segment", segId);
+                break;
+            }
+            auto status = buffer[32];
+            updateInvokeId();
+
+            // dump raw data segment for offline analysis
+            if(!dumpDirReady) {
+                if(mkdir(dumpDir, 0755) == 0 || errno == EEXIST) {
+                    dumpDirReady = true;
+                } else {
+                    LOG_WRN("failed to create dump dir '%s' (errno=%d), skipping dumps", dumpDir, errno);
+                    dumpDirReady = false;
+                }
+            }
+            if(dumpDirReady && bytesRead > 0) {
+                char fname[128];
+                snprintf(fname, sizeof(fname), "%s/seg_%02d_%04d.bin", dumpDir, segId, segIndex);
+                FILE* fp = fopen(fname, "wb");
+                if(fp) {
+                    fwrite(buffer, 1, bytesRead, fp);
+                    fclose(fp);
+                } else {
+                    LOG_WRN("failed to open dump file '%s' (errno=%d)", fname, errno);
+                }
+            }
+
+            // fish some data we need to send back in the "confirm" message
+            size_t o = 22;
+            auto u0 = be32r(buffer, o);
+            auto u1 = be32r(buffer, o);
+            auto u2 = be16r(buffer, o);
+
+            // lambda to parse samples out of each segment
+            auto parseData = [&]() {
+
+                size_t o = 30;
+                auto nbEntries = be16r(buffer, o);
+                LOG_NFO("segment has %d entries", (int)nbEntries);
+                o -= 2;
+
+                // Parse tags only from the meal segment (segId=3), record length = 10
+                if(segId == 3) {
+                    size_t payload_start = 30;
+                    size_t payload_end = (size_t)bytesRead;
+
+                    auto bcd_to_int = [](
+                        uint8_t x
+                    ) -> int {
+                        return ((x >> 4) * 10) + (x & 0x0F);
+                    };
+
+                    auto valid_bcd_timestamp = [&](
+                        size_t pos
+                    ) -> bool {
+                        if(pos + 6 >= payload_end) {
+                            return false;
+                        }
+                        if(buffer[pos] != 0x20) {
+                            return false;
+                        }
+                        auto yy_byte = buffer[pos + 1];
+                        if(!(0x20 <= yy_byte && yy_byte <= 0x30)) {
+                            return false;
+                        }
+                        int mo = bcd_to_int(buffer[pos + 2]);
+                        int da = bcd_to_int(buffer[pos + 3]);
+                        int hh = bcd_to_int(buffer[pos + 4]);
+                        int mi = bcd_to_int(buffer[pos + 5]);
+                        int ss = bcd_to_int(buffer[pos + 6]);
+                        if(mo < 1 || mo > 12) return false;
+                        if(da < 1 || da > 31) return false;
+                        if(hh < 0 || hh > 23) return false;
+                        if(mi < 0 || mi > 59) return false;
+                        if(ss < 0 || ss > 59) return false;
+                        return true;
+                    };
+
+                    // find first timestamp and walk fixed-size records (10 bytes)
+                    const int rec_len = 10;
+                    size_t start_offset = (size_t)-1;
+                    for(size_t i = payload_start; i + rec_len <= payload_end; ++i) {
+                        if(valid_bcd_timestamp(i)) {
+                            start_offset = i;
+                            break;
+                        }
+                    }
+
+                    if(start_offset != (size_t)-1) {
+                        for(size_t pos = start_offset; pos + rec_len <= payload_end; pos += rec_len) {
+                            if(!valid_bcd_timestamp(pos)) {
+                                break;
+                            }
+                            int year = 2000 + bcd_to_int(buffer[pos + 1]);
+                            int mo = bcd_to_int(buffer[pos + 2]);
+                            int da = bcd_to_int(buffer[pos + 3]);
+                            int hh = bcd_to_int(buffer[pos + 4]);
+                            int mi = bcd_to_int(buffer[pos + 5]);
+                            uint8_t code = buffer[pos + 9];
+
+                            uint8_t tag = 0;
+                            switch(code) {
+                                case 0x4C: tag = 1; break; // Antes comida
+                                case 0x50: tag = 2; break; // Desp. Comida
+                                case 0x54: tag = 3; break; // En Ayunas
+                                case 0x74: tag = 4; break; // Al acostarse
+                                default: tag = 0; break;
+                            }
+
+                            if(tag > 0) {
+                                char tsKey[32];
+                                snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, mo, da, hh, mi);
+                                if(globalTagMap.find(std::string(tsKey)) == globalTagMap.end()) {
+                                    globalTagMap[std::string(tsKey)] = tag;
+                                    LOG_NFO("Found tag code 0x%02X -> %d for timestamp %s", code, tag, tsKey);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Process glucose measurements only from segId=0 (glucose segment)
+                if(segId != 0) {
+                    return;
+                }
+
+                o = 30;
+                nbEntries = be16r(buffer, o);
+                o -= 2;
+                for(int i=0; i<nbEntries; ++i) {
+
+                    // decode weird-ass encoding of datetime values
+                    auto cvt = [](
+                        uint8_t x
+                    ) {
+                        int v = -1;
+                        char buf[8];
+                        sprintf(buf, "%02X", x);
+                        sscanf(buf, "%d", &v);
+                        return v;
+                    };
+
+                    // load date
+                    auto cc = cvt(buffer[ 6 + o]);
+                    auto yy = cvt(buffer[ 7 + o]);
+                    auto mm = cvt(buffer[ 8 + o]);
+                    auto dd = cvt(buffer[ 9 + o]);
+                    auto hh = cvt(buffer[10 + o]);
+                    auto mn = cvt(buffer[11 + o]);
+
+                    // load value and status
+                    auto ro = (14 + o);
+                    auto vv = be16r(buffer, ro);
+                    auto ss = be16r(buffer, ro);
+
+                    o += 12;
+
+                    if(vv < 20 || vv > 600) {
+                        continue;
+                    }
+
+                    // dump sample
+                    LOG_NFO(
+                        "sample: %02d%02d/%02d/%02d %02d:%02d => (mg/dL=%2d, mmol/L=%7.3f, status=0x%02x)",
+                        cc,
+                        yy,
+                        mm,
+                        dd,
+                        hh,
+                        mn,
+                        vv,
+                        (vv / 18.0),
+                        ss
+                    );
+
+                    // compute epoch
+                    struct tm t;
+                    memset(&t, 0, sizeof(t));
+                    t.tm_min = mn;
+                    t.tm_hour = hh;
+                    t.tm_mday = dd;
+                    t.tm_mon = (mm-1);
+                    t.tm_year = ((cc*100 + yy) - 1900);
+                    auto epoch = timelocal(&t);
+
+                    if(0==ss) {
+                        measurements.push_back(
+                            Measurement{
+                                cc,
+                                yy,
+                                mm,
+                                dd,
+                                hh,
+                                mn,
+                                (int)vv,
+                                (uint16_t)ss,
+                                (uint64_t)epoch
+                            }
+                        );
+                    }
+                }
+            };
+
+            // parse received data segment
+            parseData();
+            segIndex++;
+
+            // send "data received" ack
+            {
+                auto p = buffer;
+                memset(buffer, 0, sizeof(buffer));
+                be16(p, kAPDU_TYPE_PRESENTATION_APDU); // msg type
+                be16(p,     30);                       // length
+                be16(p,     28);                       // octet stringlength
+                be16(p, invokeId);                     // invoke-id from prev answer
+                be16(p, kDATA_ADPU_RESPONSE_CONFIRMED_EVENT_REPORT);
+                be16(p,     22);                       // length of what follows (could also be zero)
+                be16(p, pmStoreHandle);                // store handle
+                be32(p, 0xFFFFFFFF);                   // relative time
+                be16(p, kEVENT_TYPE_MDC_NOTI_SEGMENT_DATA);
+                be16(p,     12);
+                be32(p,     u0);
+                be32(p,     u1);
+                be16(p,     u2);
+                be16(p, 0x0080);
+
+                bulkOut(
+                    "data segment received ACK",
+                    (p-buffer)
+                );
+            }
+
+            // bail if segment was flagged as last one in the stream
+            if(0x40 & status) {
+                break;
+            }
+        }
+    }
+
+    // write samples as JSON (after all segments so tags are collected)
+    for(const auto& m : measurements) {
+        int year = 2000 + m.yy;
+        char tsKey[32];
+        snprintf(tsKey, sizeof(tsKey), "%04d-%02d-%02d %02d:%02d", year, m.mm, m.dd, m.hh, m.mn);
+        uint8_t tag = 0;
+        auto it = globalTagMap.find(std::string(tsKey));
+        if(it != globalTagMap.end()) {
+            tag = it->second;
+        }
+
+        if(tag > 0 && tag <= 5) {
+            fprintf(
+                g_output,
+                "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f, \"tag\":\"%s\" }",
+                (g_firstLine ? "" : ","),
+                (int)(g_lineCount++),
+                (uint64_t)m.epoch,
+                (int)m.cc,
+                (int)m.yy,
+                (int)m.mm,
+                (int)m.dd,
+                (int)m.hh,
+                (int)m.mn,
+                (int)m.vv,
+                (m.vv / 18.0),
+                getTagDesc(tag)
+            );
+        } else {
+            fprintf(
+                g_output,
+                "%s\n    { \"id\":%6d, \"epoch\":%11" PRIu64 ", \"timestamp\":\"%02d%02d/%02d/%02d %02d:%02d\", \"mg/dL\":%3d, \"mmol/L\":%10.6f }",
+                (g_firstLine ? "" : ","),
+                (int)(g_lineCount++),
+                (uint64_t)m.epoch,
+                (int)m.cc,
+                (int)m.yy,
+                (int)m.mm,
+                (int)m.dd,
+                (int)m.hh,
+                (int)m.mn,
+                (int)m.vv,
+                (m.vv / 18.0)
+            );
+        }
+        g_firstLine = false;
     }
 
     // protocol step: disconnect cleanly from device
@@ -1819,4 +1813,3 @@ int main(
     LOG_NFO("done");
     return 0;
 }
-
