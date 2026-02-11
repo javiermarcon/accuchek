@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <inttypes.h>
 #include <unordered_map>
+#include <limits.h>
 #include <libusb-1.0/libusb.h>
 
 // config key value pair map
@@ -175,8 +176,8 @@ enum MDC_ENUM {
 };
 
 // load config file
-static auto loadConfig() {
-auto fp = fopen("config.txt", "r");
+static auto loadConfigFromPath(const char* path) {
+  auto fp = fopen(path, "r");
   if(0!=fp) {
     size_t len = 0;
     char *line = 0;
@@ -1764,7 +1765,44 @@ int main(
     }
 
     // load config file
-    loadConfig();
+    if(const char* env = getenv("ACCUCHEK_CONFIG")) {
+        loadConfigFromPath(env);
+    } else {
+        loadConfigFromPath("config.txt");
+        if(g_config.empty() && argv[0] && strchr(argv[0], '/')) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s", argv[0]);
+            char* slash = strrchr(path, '/');
+            if(slash) {
+                *slash = '\0';
+                const char* suffix = "/config.txt";
+                size_t need = strlen(path) + strlen(suffix) + 1;
+                if(need <= PATH_MAX) {
+                    char cfg[PATH_MAX];
+                    snprintf(cfg, sizeof(cfg), "%s%s", path, suffix);
+                    loadConfigFromPath(cfg);
+                }
+            }
+        }
+        if(g_config.empty()) {
+            char exePath[PATH_MAX];
+            ssize_t n = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+            if(n > 0) {
+                exePath[n] = '\0';
+                char* slash = strrchr(exePath, '/');
+                if(slash) {
+                    *slash = '\0';
+                    const char* suffix = "/config.txt";
+                    size_t need = strlen(exePath) + strlen(suffix) + 1;
+                    if(need <= PATH_MAX) {
+                        char cfg[PATH_MAX];
+                        snprintf(cfg, sizeof(cfg), "%s%s", exePath, suffix);
+                        loadConfigFromPath(cfg);
+                    }
+                }
+            }
+        }
+    }
 
     // be silent unless asked to talk
     if(0!=getenv("ACCUCHEK_DBG")) {
